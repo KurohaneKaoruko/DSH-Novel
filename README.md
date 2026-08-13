@@ -72,4 +72,4 @@ DSH-Novel/
 
 ## 七、许可证
 
-本项目使用 [MIT License](LICENSE)，© 2025 KurohaneKaoruko。你可以自由使用、修改、分发（含商用），但需保留版权与许可声明。
+本项目使用 [MIT License](LICENSE)，© 2026 KurohaneKaoruko。你可以自由使用、修改、分发（含商用），但需保留版权与许可声明。
