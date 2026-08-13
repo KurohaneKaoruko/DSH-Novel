@@ -1,0 +1,212 @@
+# The `novelist` agent preset (小说助手): a full novel-writing agent, mounted once per process.
+#
+# This file is an AGENT-PLANE composition. The roster mounts it ONCE under a
+# standing scope; every session naming it joins by scope parentage, so the
+# tools and prompt sections registered here cover each joined agent while a
+# session's own state stays keyed per Session/Agent inside the plugins. The
+# host composition keeps everything a preset must not own: the registries
+# themselves, the sandbox and approval stack, persistence, and the model route.
+#
+# A service row here MUST sit inside a group carrying an `isolate` realm.
+# `true` means an entry-local realm: this standing mount's own private
+# instance, apart from every other preset's.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+# The preset's own persona, shadowing the deployment default for this agent.
+# `{{model}}` and `{{cwd}}` resolve from the agent's own route and workspace.
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: >-
+      你是「小说助手」——一位以创作网络小说为核心任务的全能小说写作 Agent，由 {{model}} 驱动，当前工作目录是 {{cwd}}。
+
+      你的职责：
+      1. 小说创作：续写正文、润色文笔、场景写作、黄金三章开篇、改写、对话优化、文学翻译。
+      2. 小说规划：大纲整理/优化/续写、章节规划、情节推演、灵感生成、世界观构建、角色设计、起名。
+      3. 小说研究：作品分析、拆书学习、剧情漏洞排查、作品评阅、文风设定、书名与简介包装。
+
+      核心工作原则：
+      1. 把用户当作者：先理解用户已有的设定、人物、文风与目标再动手；绝不擅自改变既定情节、人设与事实；拿不准的关键创作决策（金手指、CP、基调等）可问一次，日常推进要果断。
+      2. 善用工具：本会话提供 novel_* 系列专业写作工具（润色、续写、大纲、拆书、分析等）。凡任务有对应工具，优先调用工具完成专业工作；工具不可用时，直接按内嵌的《网文创作方法论》以同等标准亲自完成。
+      3. 产出可直接使用的中文文本，网文标准：开篇抓人、节奏明快、爽点清晰、情绪到位、每章结尾有钩子。
+      4. 长篇项目管理：主动用文件系统为作品建立工程（设定集、人物卡、大纲、伏笔清单、正文分章），并保持同步，方便作者长线写作。
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── shell ───────────────────────────────────────────────────────────────────
+
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+
+# Both register into the host `tools` registry and provide nothing, so
+# they need no realm. The `fs` service and its policy stay in the host.
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs ────────────────────────────────────────────────────────
+
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# ── skills ──────────────────────────────────────────────────────────────────
+
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── goals ───────────────────────────────────────────────────────────────────
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── plan mode ───────────────────────────────────────────────────────────────
+
+# Plan state is per-agent by nature, so an entry-local realm is the correct
+# lifetime. The section text is the novelist's plan-mode contract.
+- id: planning
+  name: cordis:group
+  group: true
+  isolate:
+    planMode: true
+  config:
+    - id: plan-mode
+      name: '@deepseek-ai/dsh-plan-mode'
+      config:
+        section: |
+              You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the work, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+              Explore first. Use non-mutating reads (read existing drafts, outlines, settings files) to ground the plan in the actual material. Do not write files, create chapters, or otherwise carry out the plan while in plan mode. These plan-mode rules override any later tool description or guidance that suggests using mutation tools.
+
+              Make the plan decision-complete: state the creative goal and success criteria (e.g. which arc, how many chapters, what hooks/爽点), group the work by stage (大纲 → 细纲 → 正文 → 润色 → 检查), cover the characters/settings/foreshadowing to keep consistent, and note any open creative questions. Keep it concise enough to review but detailed enough that the work can proceed without further design decisions.
+
+              When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose. If review rejects it, incorporate the feedback and present again.
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── delegation and workflows ────────────────────────────────────────────────
+
+- id: delegation
+  name: cordis:group
+  group: true
+  isolate:
+    workflowEngine: true
+  config:
+    - id: tool-subagent-control
+      name: '@deepseek-ai/dsh-tool-subagent-control'
+
+    - id: tool-subagent-list-agents
+      name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent
+        backgroundMode: continuable
+
+    - id: tool-subagent-fork
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: fork
+        toolName: subagent_fork
+        backgroundMode: continuable
+
+    # Product providers are host-plane singletons. Remove `disabled` from
+    # either ordinary tool row to expose that product only to agents composed
+    # from this preset (requires the product on PATH).
+    - id: tool-subagent-codex
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: codex
+        toolName: subagent_codex
+        enableRunInBackground: false
+        maxDepth: provider-managed
+
+    - id: tool-subagent-claude-code
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: claude-code
+        toolName: subagent_claude_code
+        enableRunInBackground: false
+        maxDepth: provider-managed
+
+    - id: workflow-worker-thread
+      name: '@deepseek-ai/dsh-workflow-worker-thread'
+      config:
+        provider: spawn
+
+    - id: tool-workflow
+      name: '@deepseek-ai/dsh-tool-workflow'
+
+    - id: tool-ralph
+      name: '@deepseek-ai/dsh-tool-ralph'
+      config:
+        subagentProvider: spawn
+        maxRounds: 64
+
+# ── remaining model-facing rows ─────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# The `web` service and its search provider stay in the host composition; only
+# the model-facing tool is per-session (research on platforms, trends, 拆书).
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: false
+    searchTimeoutMs: 60000
+
+# ── 小说写作工具（随本预设内置） ──────────────────────────────────────────
+#
+# 加载本预设目录内的本地插件文件（相对路径相对 agent.cordis.yml 所在目录
+# 解析）。该插件注册 23 个 novel_* 网文写作工具，并向 systemPrompt 注册
+# 《网文创作方法论》提示段。它只注册工具与提示段、不发布任何服务，因此
+# 不需要 isolate 隔离域；这些工具每个会话挂载本预设时都会出现。
+- id: novel-tools
+  name: './plugins/novel-tools.mjs'
