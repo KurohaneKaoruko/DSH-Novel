@@ -19,6 +19,7 @@
 ```
 DSH-Novel/
 ├── README.md                      # 本说明
+├── LICENSE                        # MIT 开源许可证
 ├── INSTALL.md                     # 安装指引（交给 Agent 执行，或手动参考）
 ├── plugins/                       # novel-assistant 插件源码
 │   ├── novel-assistant.host.js    # Host 半部：23 个写作工具 + 阅览窗口文件读写 RPC
@@ -68,3 +69,7 @@ DSH-Novel/
 - 修改插件：编辑 `plugins/` 下两个源文件，在当前会话用 `cordis_define(kind: existing, pluginId)` 追加新 Package，再 `cordis_run` 更新；同时同步 `agent-presets/novelist/plugins/novel-tools.mjs` 中的工具改动（预设内置版）。
 - 修改预设：编辑 `agent-presets/novelist/` 下文件，复制覆盖到 `~/.dsh/.agent-presets/novelist/`，并重新挂载校验。
 - 卸载：动态插件 `cordis_stop` / `cordis_undefine`；预设删除 `~/.dsh/.agent-presets/novelist` 目录即可。
+
+## 七、许可证
+
+本项目使用 [MIT License](LICENSE)，© 2025 KurohaneKaoruko。你可以自由使用、修改、分发（含商用），但需保留版权与许可声明。
