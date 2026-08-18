@@ -8,7 +8,7 @@
 // 提供的真实服务：ctx.tools.register() 注册模型工具、ctx.llm.stream() 完成
 // 真正的文本生成、ctx.systemPrompt.section() 注册创作方法论提示段。
 //
-// 它注册 23 个 novel_* 网文写作工具，覆盖：润色、续写、大纲整理/优化/续写、
+// 它注册 25 个 novel_* 网文写作工具，覆盖：润色、续写、去 AI 味、作品工程、大纲整理/优化/续写、
 // 小说分析、拆书学习、灵感生成、世界观构建、角色设计、章节规划、场景写作、
 // 黄金三章、书名/标题、简介与梗概、作品评阅、改写、对话优化、文学翻译、
 // 剧情漏洞排查、起名、文风设定、情节推演。
@@ -148,6 +148,11 @@ export default {
           render(args, value) { return [{ type: 'text', text: value.result }]; },
         },
         async execute(args, exec) {
+          // 支持自定义执行器（如文件读写类工具），否则走 LLM 生成
+          if (typeof spec.run === 'function') {
+            const custom = await spec.run(args, exec);
+            return { result: custom };
+          }
           const system = typeof spec.system === 'function' ? spec.system(args) : spec.system;
           const user = typeof spec.user === 'function' ? spec.user(args) : spec.user;
           const result = await generate(system, user, args, exec, spec.opts || {});
@@ -871,6 +876,112 @@ export default {
       opts: { maxTokens: 6000 },
     });
 
+    // ---------------- 24. 去 AI 味 ----------------
+    tool({
+      name: 'novel_deai',
+      description: '去 AI 味：给小说文本做「AI 腔」体检与去味——逐句找出套话、模板句、过度心理分析、形容词堆砌、书面腔对话与均匀结构，按写作红线重写，保留情节与人设。',
+      timeoutMs: 180000,
+      parameters: {
+        ...routeParams,
+        text: { type: 'string', description: '待去味的文本（片段或整章）', required: true },
+        mode: { type: 'string', enum: ['全文去味重写', '仅体检报告', '逐句精简'], description: '工作模式，默认全文去味重写' },
+        preserve: { type: 'string', description: '必须保留的内容：人名、专有名词、情节节点、事实设定等' },
+      },
+      system: (args) => `${commonSystem}
+
+你现在担任网文「去 AI 味」专项编辑，任务只有一个：把 AI 腔文字改成自然、有烟火气的网文。
+
+操作步骤：
+1. 通读全文，逐句标记 AI 腔特征：万能套话、模板句、过度心理分析、形容词/副词堆砌、书面腔对话、节奏均匀无变化。
+2. 按「mode」执行：
+   - 全文去味重写：在不改情节、人设与事实的前提下，把 AI 腔句子改写成自然网文——具体细节替代抽象概括、删冗余解释、对话口语化、打破均匀结构；宁可朴素也不要模板腔。
+   - 仅体检报告：不重写，输出问题清单，每条含【原文句】【问题类型】【改法建议】。
+   - 逐句精简：保留原意，把每句压到最利落，删废话与修饰词。
+3. 严格保留「preserve」中的内容。
+4. 输出：重写模式给出「去味后全文」+「主要修改清单（原文句 → 改后 → 原因）」；其余模式按对应要求输出。`,
+      user: (args) => compose([
+        field('待去味文本', args.text),
+        field('工作模式', args.mode),
+        field('必须保留的内容', args.preserve),
+      ]),
+      opts: { maxTokens: 8000 },
+    });
+
+    // ---------------- 25. 作品工程 ----------------
+    tool({
+      name: 'novel_project',
+      description: '作品工程：把小说组织成 Obsidian 友好的 Markdown 工程——初始化目录结构（正文/大纲/设定集/人物卡/伏笔清单）、保存章节、生成伏笔清单、整理作品索引。写小说时用来落盘与管理长篇项目。',
+      timeoutMs: 180000,
+      parameters: {
+        ...routeParams,
+        action: { type: 'string', enum: ['初始化工程', '保存章节', '生成伏笔清单', '整理索引'], description: '操作类型', required: true },
+        title: { type: 'string', description: '作品名（初始化/整理索引时用）' },
+        chapter_number: { type: 'integer', description: '章节序号（保存章节时用）' },
+        chapter_title: { type: 'string', description: '章节标题（保存章节时用）' },
+        content: { type: 'string', description: '章节正文（保存章节时用，纯文本）' },
+        story: { type: 'string', description: '故事大纲/已写内容（生成伏笔清单时用）' },
+      },
+      run: async (args, exec) => {
+        const fs = ctx.get('fs');
+        const sp = ctx.get('sandboxPolicy');
+        if (fs === undefined || sp === undefined) throw new Error('文件系统服务不可用');
+        const session = exec && exec.agent ? exec.agent.session : undefined;
+        const root = session && session.header && typeof session.header.cwd === 'string' && session.header.cwd
+          ? session.header.cwd
+          : (sp.workspaceRoot && sp.workspaceRoot.length ? sp.workspaceRoot : '.');
+        const policy = sp.resolve(session !== undefined ? { session } : {});
+        const write = async (rel, text) => {
+          const target = await fs.resolve(rel, { cwd: root });
+          await fs.writeText(target, text, undefined, undefined, policy);
+          return rel;
+        };
+        const action = args && typeof args.action === 'string' ? args.action : '';
+        const out = [];
+        if (action === '初始化工程') {
+          const t = args && args.title ? args.title : '未命名作品';
+          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护）\n\n- 简介：\n- 状态：\n- 章节：见 \`正文/\`\n- 伏笔：见 \`伏笔清单.md\`\n`);
+          await write('伏笔清单.md', `# 伏笔清单\n\n| 伏笔 | 铺设位置 | 发酵 | 回收位置 | 状态 |\n| --- | --- | --- | --- | --- |\n`);
+          await write('大纲/说明.md', '# 大纲\n\n分卷-章节大纲（Markdown 结构）\n');
+          await write('设定集/说明.md', '# 设定集\n\n世界观、力量体系、地理、势力等设定（Markdown 结构）\n');
+          await write('人物卡/说明.md', '# 人物卡\n\n每个角色一个文件或一段（Markdown 结构）\n');
+          await write('正文/说明.md', '# 正文\n\n每章一个文件：`第001章-标题.md`，正文为纯文本、不加 markdown 符号\n');
+          out.push('已初始化工程：README.md、伏笔清单.md、大纲/、设定集/、人物卡/、正文/');
+        } else if (action === '保存章节') {
+          const num = args && args.chapter_number ? args.chapter_number : 1;
+          const ct = args && args.chapter_title ? args.chapter_title : '';
+          const body = args && typeof args.content === 'string' && args.content.trim() ? args.content : '';
+          if (!body) throw new Error('章节正文为空，请传入 content');
+          const file = `正文/第${String(num).padStart(3, '0')}章${ct ? '-' + ct : ''}.md`;
+          await write(file, body);
+          out.push(`已保存章节：${file}`);
+        } else if (action === '生成伏笔清单') {
+          const story = args && typeof args.story === 'string' && args.story.trim() ? args.story : '';
+          if (!story) throw new Error('缺少 story，无法分析伏笔');
+          const system = `${commonSystem}
+
+你现在担任网文伏笔管理专家。从提供的故事/大纲中梳理所有伏笔，输出 Markdown 表格：
+| 伏笔 | 铺设位置 | 发酵 | 回收位置 | 状态 |
+状态取「铺设中/发酵中/已回收/待回收」。信息不明处标【待定】。`;
+          const text = await generate(system, `【故事/大纲】\n${story}`, args, exec, { maxTokens: 4000 });
+          await write('伏笔清单.md', `# 伏笔清单\n\n${text}`);
+          out.push('已生成伏笔清单：伏笔清单.md');
+        } else if (action === '整理索引') {
+          const t = args && args.title ? args.title : '未命名作品';
+          let chapters = [];
+          try {
+            const dirTarget = await fs.resolve('正文', { cwd: root });
+            const entries = await fs.listDir(dirTarget);
+            chapters = entries.filter((e) => e.type === 'file' && /\.md$/.test(e.name)).map((e) => e.name).sort();
+          } catch (err) { chapters = []; }
+          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护）\n\n- 简介：\n- 状态：\n- 章节数：${chapters.length}\n\n## 章节\n\n${chapters.map((c) => `- [[${c.replace(/\.md$/, '')}]]`).join('\n') || '（暂无章节）'}\n\n- 伏笔：见 [[伏笔清单]]\n`);
+          out.push(`已整理索引：README.md（${chapters.length} 章）`);
+        } else {
+          throw new Error(`未知操作：${action}`);
+        }
+        return out.join('\n');
+      },
+    });
+
     // ---------------- 创作方法论提示段 ----------------
     // 随预设注入 systemPrompt，确保即使 novel_* 工具不可用，Agent 也具备
     // 完整的网文创作方法论，可独立完成同等质量的创作任务。
@@ -907,7 +1018,12 @@ export default {
 - 检查抽象概括，换成具体细节；
 - 检查心理独白是否过密，删到克制；
 - 检查对话是否书面化，改口语；
-- 检查结构是否均匀，打破「动作—心理—结论」的循环。`,
+- 检查结构是否均匀，打破「动作—心理—结论」的循环。
+
+九、作品工程与落盘（Obsidian 友好）
+- 成果统一落盘 Markdown：大纲/设定集/人物卡用标题与列表；章节正文用纯文本、不加任何 markdown 符号。
+- 章节每章一个文件：正文/第001章-标题.md；重要伏笔记入 伏笔清单.md（铺设/发酵/回收状态表）。
+- 用 novel_project 工具初始化工程、保存章节、生成伏笔清单、整理索引；鼓励用户用 Obsidian 打开工作区阅读与批注。`,
     }));
 
     return () => { for (const d of disposers) d(); };
