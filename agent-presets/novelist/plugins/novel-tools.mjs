@@ -8,10 +8,14 @@
 // 提供的真实服务：ctx.tools.register() 注册模型工具、ctx.llm.stream() 完成
 // 真正的文本生成、ctx.systemPrompt.section() 注册创作方法论提示段。
 //
-// 它注册 25 个 novel_* 网文写作工具，覆盖：润色、续写、去 AI 味、作品工程、大纲整理/优化/续写、
-// 小说分析、拆书学习、灵感生成、世界观构建、角色设计、章节规划、场景写作、
-// 黄金三章、书名/标题、简介与梗概、作品评阅、改写、对话优化、文学翻译、
-// 剧情漏洞排查、起名、文风设定、情节推演。
+// 它注册 30 个 novel_* 网文写作工具，覆盖两条主线：
+// ① 创作单点：润色、续写、去 AI 味、大纲整理/优化/续写、小说分析、拆书学习、灵感生成、
+//    世界观构建、角色设计、章节规划、场景写作、黄金三章、书名/标题、简介与梗概（含前情提要/
+//    章末摘要）、作品评阅、改写、对话优化、文学翻译、剧情漏洞排查、起名、文风设定、情节推演、
+//    角色采访、平台合规体检；
+// ② 长篇工程闭环：作品工程（novel_project）、写前简报（novel_briefing）、单章成稿流水线
+//    （novel_write_chapter：草稿→自查→修订）、章后归档（novel_archive）——四者组成每章的
+//    标准循环，让伏笔清单、时间线、人物卡随写随更，长篇一致性不靠模型硬扛。
 export default {
   name: 'novel-tools',
   inject: ['llm', 'tools', 'systemPrompt'],
@@ -111,6 +115,74 @@ export default {
       if (typeof v === 'string' && v.trim()) return v.split(/[,，、\s]+/).filter(Boolean);
       return fallback;
     }
+    // 从 LLM 输出中按 ===NAME=== 分隔符提取小节（章后归档用）
+    function extractSection(text, name) {
+      const m = text.match(new RegExp(`===${name}===([\\s\\S]*?)(?:\\n===\\w+===|$)`));
+      return m ? m[1].trim() : '';
+    }
+    // 章节文件名里的标题需要去掉文件系统不安全字符
+    function safeName(name) {
+      return String(name).replace(/[\\/:*?"<>|\r\n]/g, '').trim();
+    }
+    // 解析会话工作区根目录（novel_project 同款逻辑，抽出来共用）
+    function workspaceRoot(exec, sp) {
+      const session = exec && exec.agent ? exec.agent.session : undefined;
+      return session && session.header && typeof session.header.cwd === 'string' && session.header.cwd
+        ? session.header.cwd
+        : (sp.workspaceRoot && sp.workspaceRoot.length ? sp.workspaceRoot : '.');
+    }
+    // 打开作品工程：读取（缺文件容错）、列 Markdown、写入三件套。工程目录约定：
+    // 正文/（每章一个文件）、大纲/、设定集/、人物卡/、归档/、伏笔清单.md、时间线.md、README.md。
+    // 各目录下由初始化生成的 说明.md 是脚手架，列目录时跳过。
+    function openProject(fs, root, policy) {
+      const readMaybe = async (rel, cap) => {
+        try {
+          const target = await fs.resolve(rel, { cwd: root });
+          let text = await fs.readText(target);
+          if (cap && text.length > cap) text = `${text.slice(0, cap)}\n…（已截断）`;
+          return text;
+        } catch (err) { return null; }
+      };
+      const listMd = async (dir) => {
+        try {
+          const target = await fs.resolve(dir, { cwd: root });
+          const entries = await fs.listDir(target);
+          return entries
+            .filter((e) => e.type === 'file' && /\.md$/.test(e.name) && e.name !== '说明.md')
+            .map((e) => e.name).sort();
+        } catch (err) { return []; }
+      };
+      const write = async (rel, text) => {
+        const target = await fs.resolve(rel, { cwd: root });
+        await fs.writeText(target, text, undefined, undefined, policy);
+        return rel;
+      };
+      // 章节文件按「第NNN章」序号排序取最新一篇；number 给定时取序号小于它的最后一章
+      const latestChapter = async (number) => {
+        const names = await listMd('正文');
+        const parsed = names
+          .map((n) => ({ n, num: parseInt((n.match(/^第(\d+)章/) || [])[1], 10) }))
+          .filter((c) => !Number.isNaN(c.num) && (number === undefined || number === null || c.num < number));
+        if (!parsed.length) return null;
+        parsed.sort((a, b) => a.num - b.num);
+        return parsed[parsed.length - 1].n;
+      };
+      const chapterTail = async (number, chars) => {
+        const name = await latestChapter(number);
+        if (!name) return null;
+        const text = await readMaybe(`正文/${name}`);
+        if (!text) return null;
+        return { name, tail: text.length > chars ? text.slice(-chars) : text };
+      };
+      return { readMaybe, listMd, write, latestChapter, chapterTail };
+    }
+    // 保存一章正文到 正文/第NNN章-标题.md，返回相对路径
+    async function saveChapterFile(fs, root, policy, num, title, body) {
+      const file = `正文/第${String(num).padStart(3, '0')}章${title ? '-' + safeName(title) : ''}.md`;
+      const target = await fs.resolve(file, { cwd: root });
+      await fs.writeText(target, body, undefined, undefined, policy);
+      return file;
+    }
 
     const commonSystem = `你是一位服务网络小说作者的职业写作助手，精通中文网文创作技巧：黄金三章、爽点设计、节奏把控、人物弧光、悬念伏笔、对话艺术与画面感营造。
 
@@ -121,9 +193,9 @@ export default {
 4. 涉及改写/续写时，保持与原文一致的连贯性、人物语气与叙事视角。
 
 【去 AI 味 · 写作红线】（正文一律遵守，宁可平淡也不要 AI 腔）：
-1. 禁用万能套话：如「在这个……的世界里」「他不知道的是」「时间仿佛凝固」「空气瞬间安静」「眼底闪过一丝」「嘴角勾起一抹」「这一刻，世界都安静了」「然而事情远没有这么简单」。
+1. 禁用万能套话：如「在这个……的世界里」「他不知道的是」「时间仿佛凝固」「空气瞬间安静」「眼底闪过一丝」「嘴角勾起一抹」「这一刻，世界都安静了」「然而事情远没有这么简单」「不知过了多久」「一室寂静」。
 2. 具体代替抽象：少写「他很生气」这类概括，用动作、眼神、语气、小动作让读者自己看见；用名词和动词承载，形容词副词能省则省。
-3. 拒绝堆砌：不连续堆四字词，不用排比撑场面，不滥用「缓缓」「轻轻」「微微」。
+3. 拒绝堆砌：不连续堆四字词，不用排比撑场面，不滥用「缓缓」「轻轻」「微微」；「一丝」「一抹」「几分」等万能量词一律砍掉；一段里「仿佛/像/似乎」式比喻最多留一个、只留最准的那个。
 4. 少解释多留白：别在每个动作后补心理分析，内心戏只在关键处给一两句；留白让读者自己脑补。
 5. 对话像人话：口语化、有口癖、有停顿、有答非所问，别让每个人物都像念书面报告。
 6. 结构长短错落：长短句、长短段交替；允许平淡过渡，别陷入「动作—心理—结论」的循环。
@@ -515,6 +587,7 @@ export default {
         setting: { type: 'string', description: '人物与设定（可选）' },
         pov: { type: 'string', description: '叙事视角（可选）' },
         length: { type: 'integer', description: '目标字数（可选）' },
+        style: { type: 'string', description: '风格要求（可选）' },
       },
       system: (args) => `${commonSystem}
 
@@ -532,6 +605,7 @@ export default {
         field('人物与设定', args.setting),
         field('叙事视角', args.pov),
         args.length ? `【目标字数】约 ${args.length} 字` : '',
+        field('风格要求', args.style),
       ]),
       opts: { maxTokens: 8000 },
     });
@@ -602,26 +676,35 @@ export default {
     // ---------------- 15. 简介与梗概 ----------------
     tool({
       name: 'novel_synopsis',
-      description: '简介与梗概：撰写平台简介（300字内）、一句话简介、完整梗概、投稿大纲或版权推荐语，抓卖点与悬念，不剧透结局。',
+      description: '简介与梗概：撰写平台简介（300字内）、一句话简介、完整梗概、投稿大纲、版权推荐语，以及连载用的前情提要（读者向）与章末摘要（作者向），抓卖点与悬念。',
       timeoutMs: 120000,
       parameters: {
         ...routeParams,
-        summary: { type: 'string', description: '故事内容/核心卖点', required: true },
-        kind: { type: 'string', enum: ['平台简介', '一句话简介', '完整梗概', '投稿大纲', '版权推荐语'], description: '输出类型，默认平台简介' },
+        summary: { type: 'string', description: '故事内容/核心卖点（前情提要/章末摘要时填已有剧情或本章正文）', required: true },
+        kind: { type: 'string', enum: ['平台简介', '一句话简介', '完整梗概', '投稿大纲', '版权推荐语', '前情提要', '章末摘要'], description: '输出类型，默认平台简介' },
         platform: { type: 'string', description: '目标平台（可选）' },
         tone: { type: 'string', description: '语气风格（可选）' },
       },
-      system: (args) => `${commonSystem}
+      system: (args) => {
+        const kind = args && typeof args.kind === 'string' ? args.kind : '平台简介';
+        const kindRule = {
+          '平台简介': '- 平台简介：300 字以内，先给卖点与悬念，再给主角与冲突，最后留钩子；不剧透结局；分段与断句要适合平台阅读。',
+          '一句话简介': '- 一句话简介：20 字以内，凝练核心看点。',
+          '完整梗概': '- 完整梗概：500-1000 字，按起承转合讲清主线。',
+          '投稿大纲': '- 投稿大纲：含作品定位、人物表、主线分卷概述、卖点分析。',
+          '版权推荐语': '- 版权推荐语：突出改编潜力与差异化卖点。',
+          '前情提要': '- 前情提要（读者向）：200-300 字回顾此前剧情的关键事件，可以剧透，按时间顺序串联，只留主线、略去支线细节；语言有代入感、不是流水账；结尾停在最新的悬念处，自然衔接最新一章。',
+          '章末摘要': '- 章末摘要（作者向）：150 字以内，客观记录本章发生的事件、人物状态变化、伏笔的铺设/推进/回收，供作品工程归档使用；不修饰不渲染。',
+        }[kind] || '- 平台简介：300 字以内，先给卖点与悬念，再给主角与冲突，最后留钩子；不剧透结局。';
+        return `${commonSystem}
 
 你现在担任网文简介写作专家。
 
 要求（按输出类型）：
-- 平台简介：300 字以内，先给卖点与悬念，再给主角与冲突，最后留钩子；不剧透结局；分段与断句要适合平台阅读。
-- 一句话简介：20 字以内，凝练核心看点。
-- 完整梗概：500-1000 字，按起承转合讲清主线。
-- 投稿大纲：含作品定位、人物表、主线分卷概述、卖点分析。
-- 版权推荐语：突出改编潜力与差异化卖点。
-2. 语气按指定风格；平台不同可调整句式（番茄短句多、晋江情绪化、起点重设定钩子）。`,
+${kindRule}
+2. 语气按指定风格；平台不同可调整句式（番茄短句多、晋江情绪化、起点重设定钩子）。
+3. 前情提要与章末摘要必须忠于原文事实，不得新增原文没有的情节。`;
+      },
       user: (args) => compose([
         field('故事内容/卖点', args.summary),
         field('输出类型', args.kind),
@@ -892,7 +975,7 @@ export default {
 你现在担任网文「去 AI 味」专项编辑，任务只有一个：把 AI 腔文字改成自然、有烟火气的网文。
 
 操作步骤：
-1. 通读全文，逐句标记 AI 腔特征：万能套话、模板句、过度心理分析、形容词/副词堆砌、书面腔对话、节奏均匀无变化。
+1. 通读全文，逐句标记 AI 腔特征：万能套话、模板句、过度心理分析、形容词/副词堆砌、万能量词（一丝/一抹/几分）、连用比喻（仿佛/像/似乎）、书面腔对话、均匀无变化的段落结构与节奏。
 2. 按「mode」执行：
    - 全文去味重写：在不改情节、人设与事实的前提下，把 AI 腔句子改写成自然网文——具体细节替代抽象概括、删冗余解释、对话口语化、打破均匀结构；宁可朴素也不要模板腔。
    - 仅体检报告：不重写，输出问题清单，每条含【原文句】【问题类型】【改法建议】。
@@ -910,76 +993,409 @@ export default {
     // ---------------- 25. 作品工程 ----------------
     tool({
       name: 'novel_project',
-      description: '作品工程：把小说组织成 Obsidian 友好的 Markdown 工程——初始化目录结构（正文/大纲/设定集/人物卡/伏笔清单）、保存章节、生成伏笔清单、整理作品索引。写小说时用来落盘与管理长篇项目。',
+      description: '作品工程：把小说组织成 Obsidian 友好的 Markdown 工程——初始化目录结构（正文/大纲/设定集/人物卡/归档/伏笔清单/时间线）、保存章节、生成伏笔清单、生成时间线、统计进度、整理作品索引。长篇项目管理的基础工具。',
       timeoutMs: 180000,
       parameters: {
         ...routeParams,
-        action: { type: 'string', enum: ['初始化工程', '保存章节', '生成伏笔清单', '整理索引'], description: '操作类型', required: true },
+        action: { type: 'string', enum: ['初始化工程', '保存章节', '生成伏笔清单', '生成时间线', '统计进度', '整理索引'], description: '操作类型', required: true },
         title: { type: 'string', description: '作品名（初始化/整理索引时用）' },
         chapter_number: { type: 'integer', description: '章节序号（保存章节时用）' },
         chapter_title: { type: 'string', description: '章节标题（保存章节时用）' },
         content: { type: 'string', description: '章节正文（保存章节时用，纯文本）' },
-        story: { type: 'string', description: '故事大纲/已写内容（生成伏笔清单时用）' },
+        story: { type: 'string', description: '故事大纲/已写内容（生成伏笔清单/生成时间线时用）' },
       },
       run: async (args, exec) => {
         const fs = ctx.get('fs');
         const sp = ctx.get('sandboxPolicy');
         if (fs === undefined || sp === undefined) throw new Error('文件系统服务不可用');
         const session = exec && exec.agent ? exec.agent.session : undefined;
-        const root = session && session.header && typeof session.header.cwd === 'string' && session.header.cwd
-          ? session.header.cwd
-          : (sp.workspaceRoot && sp.workspaceRoot.length ? sp.workspaceRoot : '.');
+        const root = workspaceRoot(exec, sp);
         const policy = sp.resolve(session !== undefined ? { session } : {});
-        const write = async (rel, text) => {
-          const target = await fs.resolve(rel, { cwd: root });
-          await fs.writeText(target, text, undefined, undefined, policy);
-          return rel;
-        };
+        const proj = openProject(fs, root, policy);
+        const write = proj.write;
         const action = args && typeof args.action === 'string' ? args.action : '';
         const out = [];
         if (action === '初始化工程') {
           const t = args && args.title ? args.title : '未命名作品';
-          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护）\n\n- 简介：\n- 状态：\n- 章节：见 \`正文/\`\n- 伏笔：见 \`伏笔清单.md\`\n`);
+          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护）\n\n- 简介：\n- 状态：\n- 章节：见 \`正文/\`\n- 伏笔：见 \`伏笔清单.md\`\n- 时间线：见 \`时间线.md\`\n`);
           await write('伏笔清单.md', `# 伏笔清单\n\n| 伏笔 | 铺设位置 | 发酵 | 回收位置 | 状态 |\n| --- | --- | --- | --- | --- |\n`);
+          await write('时间线.md', `# 时间线\n\n| 时间 | 事件 | 参与人物 | 影响/后续 |\n| --- | --- | --- | --- |\n`);
           await write('大纲/说明.md', '# 大纲\n\n分卷-章节大纲（Markdown 结构）\n');
           await write('设定集/说明.md', '# 设定集\n\n世界观、力量体系、地理、势力等设定（Markdown 结构）\n');
           await write('人物卡/说明.md', '# 人物卡\n\n每个角色一个文件或一段（Markdown 结构）\n');
+          await write('归档/说明.md', '# 归档\n\n每章写完的状态归档（由 novel_archive 生成）：第NNN章-归档.md，含章节摘要、人物状态变化、新增设定\n');
           await write('正文/说明.md', '# 正文\n\n每章一个文件：`第001章-标题.md`，正文为纯文本、不加 markdown 符号\n');
-          out.push('已初始化工程：README.md、伏笔清单.md、大纲/、设定集/、人物卡/、正文/');
+          out.push('已初始化工程：README.md、伏笔清单.md、时间线.md、大纲/、设定集/、人物卡/、归档/、正文/');
         } else if (action === '保存章节') {
           const num = args && args.chapter_number ? args.chapter_number : 1;
-          const ct = args && args.chapter_title ? args.chapter_title : '';
           const body = args && typeof args.content === 'string' && args.content.trim() ? args.content : '';
           if (!body) throw new Error('章节正文为空，请传入 content');
-          const file = `正文/第${String(num).padStart(3, '0')}章${ct ? '-' + ct : ''}.md`;
-          await write(file, body);
+          const file = await saveChapterFile(fs, root, policy, num, args && args.chapter_title ? args.chapter_title : '', body);
           out.push(`已保存章节：${file}`);
-        } else if (action === '生成伏笔清单') {
+        } else if (action === '生成伏笔清单' || action === '生成时间线') {
           const story = args && typeof args.story === 'string' && args.story.trim() ? args.story : '';
-          if (!story) throw new Error('缺少 story，无法分析伏笔');
-          const system = `${commonSystem}
+          if (!story) throw new Error(`缺少 story，无法${action}`);
+          let system;
+          if (action === '生成伏笔清单') {
+            system = `${commonSystem}
 
 你现在担任网文伏笔管理专家。从提供的故事/大纲中梳理所有伏笔，输出 Markdown 表格：
 | 伏笔 | 铺设位置 | 发酵 | 回收位置 | 状态 |
-状态取「铺设中/发酵中/已回收/待回收」。信息不明处标【待定】。`;
+状态取「铺设中/发酵中/已回收/待回收」。信息不明处标【待定】。只输出表格，不要其他说明。`;
+          } else {
+            system = `${commonSystem}
+
+你现在担任网文时间线整理专家。从提供的故事/已写内容中梳理事件时间线，输出 Markdown 表格：
+| 时间 | 事件 | 参与人物 | 影响/后续 |
+时间用故事内纪年/相对时间（如「开篇当日」「三天后」），信息不明处标【待定】。按故事内时间先后排序。只输出表格，不要其他说明。`;
+          }
           const text = await generate(system, `【故事/大纲】\n${story}`, args, exec, { maxTokens: 4000 });
-          await write('伏笔清单.md', `# 伏笔清单\n\n${text}`);
-          out.push('已生成伏笔清单：伏笔清单.md');
+          const file = action === '生成伏笔清单' ? '伏笔清单.md' : '时间线.md';
+          const header = action === '生成伏笔清单' ? '# 伏笔清单\n\n' : '# 时间线\n\n';
+          await write(file, `${header}${text}\n`);
+          out.push(`已${action}：${file}`);
+        } else if (action === '统计进度') {
+          const names = await proj.listMd('正文');
+          const rows = [];
+          let total = 0;
+          for (const name of names) {
+            const text = await proj.readMaybe(`正文/${name}`);
+            const count = text ? text.replace(/\s+/g, '').length : 0;
+            total += count;
+            rows.push(`| ${name.replace(/\.md$/, '')} | ${count} |`);
+          }
+          const avg = names.length ? Math.round(total / names.length) : 0;
+          out.push([
+            `## 进度统计`,
+            ``,
+            `| 章节 | 字数 |`,
+            `| --- | --- |`,
+            ...rows,
+            ``,
+            `章节数：${names.length}；总字数：${total}；平均每章：${avg}`,
+          ].join('\n'));
         } else if (action === '整理索引') {
           const t = args && args.title ? args.title : '未命名作品';
-          let chapters = [];
-          try {
-            const dirTarget = await fs.resolve('正文', { cwd: root });
-            const entries = await fs.listDir(dirTarget);
-            chapters = entries.filter((e) => e.type === 'file' && /\.md$/.test(e.name)).map((e) => e.name).sort();
-          } catch (err) { chapters = []; }
-          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护）\n\n- 简介：\n- 状态：\n- 章节数：${chapters.length}\n\n## 章节\n\n${chapters.map((c) => `- [[${c.replace(/\.md$/, '')}]]`).join('\n') || '（暂无章节）'}\n\n- 伏笔：见 [[伏笔清单]]\n`);
+          const chapters = await proj.listMd('正文');
+          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护）\n\n- 简介：\n- 状态：\n- 章节数：${chapters.length}\n\n## 章节\n\n${chapters.map((c) => `- [[${c.replace(/\.md$/, '')}]]`).join('\n') || '（暂无章节）'}\n\n- 伏笔：见 [[伏笔清单]]\n- 时间线：见 [[时间线]]\n`);
           out.push(`已整理索引：README.md（${chapters.length} 章）`);
         } else {
           throw new Error(`未知操作：${action}`);
         }
         return out.join('\n');
       },
+    });
+
+    // ---------------- 26. 单章成稿流水线 ----------------
+    tool({
+      name: 'novel_write_chapter',
+      description: '单章成稿流水线：按本章细纲+写前简报一次性产出整章定稿——内部走「草稿→（自查）→修订」多稿流程，逐项过写作红线，可选直接保存进作品工程。写正文章节的首选工具，长篇推进时配合 novel_briefing 与 novel_archive 使用。',
+      timeoutMs: 600000,
+      parameters: {
+        ...routeParams,
+        chapter_plan: { type: 'string', description: '本章细纲：本章要发生的事件、转折、爽点、伏笔处理、结尾钩子方向', required: true },
+        brief: { type: 'string', description: '写前简报：出场人物要点、活跃伏笔、相关设定、上文衔接（novel_briefing 的输出；可选）' },
+        outline: { type: 'string', description: '全书/本卷大纲的相关部分（可选）' },
+        setting: { type: 'string', description: '世界观与人物设定（可选）' },
+        previous_tail: { type: 'string', description: '上一章结尾的原文（几百字即可），保证无缝衔接（可选）' },
+        length: { type: 'integer', description: '目标字数，默认 3000' },
+        passes: { type: 'string', enum: ['直接成稿', '草稿+修订', '草稿+自查+修订'], description: '成稿模式：默认草稿+修订；重要章节用草稿+自查+修订' },
+        requirements: { type: 'string', description: '额外要求（可选）' },
+        save: { type: 'boolean', description: '是否保存进作品工程（正文/第NNN章-标题.md），默认 false' },
+        chapter_number: { type: 'integer', description: '章节序号（save 时用）' },
+        chapter_title: { type: 'string', description: '章节标题（save 时用）' },
+      },
+      run: async (args, exec) => {
+        const plan = args && typeof args.chapter_plan === 'string' && args.chapter_plan.trim() ? args.chapter_plan.trim() : '';
+        if (!plan) throw new Error('缺少本章细纲（chapter_plan），请先给出本章要写的内容');
+        const length = args && args.length ? args.length : 3000;
+        const passes = args && typeof args.passes === 'string' && args.passes ? args.passes : '草稿+修订';
+        const context = compose([
+          field('写前简报（出场人物/活跃伏笔/相关设定/衔接要点）', args.brief),
+          field('大纲（相关部分）', args.outline),
+          field('世界观与人物设定', args.setting),
+          field('上一章结尾（紧接其后续写，不要重复）', args.previous_tail),
+          field('本章细纲', plan),
+          field('额外要求', args.requirements),
+          `【目标字数】约 ${length} 字（上下浮动不超过 20%）`,
+        ]);
+        const writerSystem = `${commonSystem}
+
+你现在担任网文章节写手，负责按细纲写出整章正文。
+
+单章成稿规范：
+1. 直接输出正文：不要章节标题、不要前言后语、不要任何解释、不要 markdown 符号。
+2. 有「上一章结尾」时必须紧接其自然续写，不重复上文；没有上文时按黄金三章法则开篇。
+3. 严格按「本章细纲」推进：细纲中的事件、转折、伏笔与爽点都要落实到正文；细纲之外不得擅自增加重大剧情。
+4. 出场人物言行严格符合简报与设定：性格、口癖、关系、当前状态一致；活跃伏笔如本章涉及，务必按细纲处理。
+5. 结尾必须留钩子：悬念、期待或情绪余韵，指向下一章。
+6. 正文遵守【去 AI 味 · 写作红线】，宁可平淡也不要 AI 腔。`;
+        const finisherSystem = `${commonSystem}
+
+你现在担任网文终稿写手，任务是把「初稿」修订为可直接发布的定稿。
+
+修订清单（逐项检查并落实修改）：
+1. 去 AI 味红线逐项过：套话清零、抽象概括换具体细节、心理独白克制、对话口语化、结构长短错落、量词与比喻堆砌清除。
+2. 开头是否紧接上文、结尾钩子是否成立有力；不成立就改写。
+3. 人物言行是否符合设定与简报；越界处纠正。
+4. 细纲事件是否全部落实；删除注水、重复与离题内容。
+5. 字数是否达标（±20%）；不足则按细纲补充场景与细节，不注水。
+只输出修订后的完整正文，不要任何说明。`;
+        const draft = await generate(writerSystem, context, args, exec, { maxTokens: 8000 });
+        let final = draft;
+        if (passes === '草稿+修订') {
+          final = await generate(finisherSystem, compose([context, field('初稿', draft)]), args, exec, { maxTokens: 8000 });
+        } else if (passes === '草稿+自查+修订') {
+          const critique = await generate(`${commonSystem}
+
+你现在担任网文审稿编辑，对「初稿」做发布前自查，只输出问题清单、不重写。
+
+逐项检查：
+1. 去 AI 味红线八条逐条对照，指出违规句并引用原句。
+2. 开头衔接、结尾钩子、细纲落实、爽点兑现、伏笔处理、人物一致性、视角稳定、字数达标。
+3. 每个问题输出：【位置】【问题】【具体改法】，按严重程度排序；没有问题的项明确写「通过」。`, compose([context, field('初稿', draft)]), args, exec, { maxTokens: 3000 });
+          final = await generate(finisherSystem, compose([context, field('初稿', draft), field('审稿问题清单', critique)]), args, exec, { maxTokens: 8000 });
+        }
+        let savedLine = '';
+        if (args && args.save) {
+          const fs = ctx.get('fs');
+          const sp = ctx.get('sandboxPolicy');
+          if (fs === undefined || sp === undefined) throw new Error('文件系统服务不可用，无法保存；请直接取用下方正文');
+          const session = exec && exec.agent ? exec.agent.session : undefined;
+          const root = workspaceRoot(exec, sp);
+          const policy = sp.resolve(session !== undefined ? { session } : {});
+          const file = await saveChapterFile(fs, root, policy, args.chapter_number || 1, args.chapter_title || '', final);
+          savedLine = `已保存：${file}`;
+        }
+        return compose([
+          savedLine,
+          `【成稿模式】${passes}；定稿约 ${final.replace(/\s+/g, '').length} 字。定稿后建议用 novel_archive 归档本章（更新伏笔清单/时间线/人物状态）。`,
+          final,
+        ]);
+      },
+    });
+
+    // ---------------- 27. 写前简报 ----------------
+    tool({
+      name: 'novel_briefing',
+      description: '写前简报：从作品工程（大纲/设定集/人物卡/伏笔清单/时间线/最近归档/上一章结尾）中汇总写作上下文，浓缩成一份「写前简报」，供续写或 novel_write_chapter 单章成稿使用。每章动笔前先调它，长篇一致性靠它兜底。',
+      timeoutMs: 300000,
+      parameters: {
+        ...routeParams,
+        chapter_number: { type: 'integer', description: '准备写的章节序号（用于定位上一章结尾；不填则取最新一章之后）' },
+        focus: { type: 'string', description: '本章计划/要写什么（可选，帮助简报取舍重点）' },
+        condense: { type: 'boolean', description: '是否用模型浓缩成简报；false 时返回原始汇总材料，默认 true' },
+      },
+      run: async (args, exec) => {
+        const fs = ctx.get('fs');
+        const sp = ctx.get('sandboxPolicy');
+        if (fs === undefined || sp === undefined) throw new Error('文件系统服务不可用');
+        const session = exec && exec.agent ? exec.agent.session : undefined;
+        const root = workspaceRoot(exec, sp);
+        const policy = sp.resolve(session !== undefined ? { session } : {});
+        const proj = openProject(fs, root, policy);
+        const parts = [];
+        const collect = async (dir, label, maxFiles, cap) => {
+          const names = await proj.listMd(dir);
+          for (const name of names.slice(0, maxFiles)) {
+            const text = await proj.readMaybe(`${dir}/${name}`, cap);
+            if (text && text.trim()) parts.push(`【${label} · ${name.replace(/\.md$/, '')}】\n${text}`);
+          }
+        };
+        await collect('大纲', '大纲', 4, 2500);
+        await collect('设定集', '设定', 6, 2000);
+        await collect('人物卡', '人物卡', 8, 2000);
+        const foreshadow = await proj.readMaybe('伏笔清单.md', 3000);
+        if (foreshadow && foreshadow.trim()) parts.push(`【伏笔清单】\n${foreshadow}`);
+        const timeline = await proj.readMaybe('时间线.md', 2000);
+        if (timeline && timeline.trim()) parts.push(`【时间线】\n${timeline}`);
+        const archives = await proj.listMd('归档');
+        if (archives.length) {
+          const latest = await proj.readMaybe(`归档/${archives[archives.length - 1]}`, 2000);
+          if (latest && latest.trim()) parts.push(`【最近归档 · ${archives[archives.length - 1].replace(/\.md$/, '')}】\n${latest}`);
+        }
+        const prev = await proj.chapterTail(args && args.chapter_number, 1200);
+        if (prev) parts.push(`【上一章结尾 · ${prev.name.replace(/\.md$/, '')}】\n${prev.tail}`);
+        if (!parts.length) {
+          throw new Error('工作区没有找到作品工程（大纲/设定集/人物卡/伏笔清单/正文）。先用 novel_project 初始化工程并保存内容，或改用工具参数直接传入材料。');
+        }
+        const materials = parts.join('\n\n');
+        const condense = !args || args.condense !== false;
+        if (!condense) return `【写前材料汇总】（原始材料，共 ${parts.length} 项）\n\n${materials}`;
+        const system = `${commonSystem}
+
+你现在担任网文主编号手，负责在作者动笔前把工程材料浓缩成一份「写前简报」。简报是下一章写作的唯一上下文来源，务必精炼且不丢关键事实。
+
+输出格式（Markdown，每节简明扼要）：
+## 主线进度
+（用 3-5 句话概括故事当前进展与所处剧情位置）
+## 本章任务
+（结合「本章计划」给出本章要完成的事件/爽点/钩子；未提供本章计划则给出建议的下一步）
+## 出场人物要点
+（本章可能出场的人物：当前状态、动机、关系变化、口癖要点）
+## 活跃伏笔
+（状态为铺设中/发酵中/待回收的伏笔，标注本章是否需要推进或回收）
+## 相关设定
+（本章会用到的世界观/力量体系/地点设定要点）
+## 衔接要点
+（上一章结尾的场面、情绪与悬而未决处，下一章开头必须承接）
+## 注意事项
+（时间线、人物状态、战力等一致性风险提示）`;
+        const brief = await generate(system, compose([field('本章计划', args && args.focus), materials]), args, exec, { maxTokens: 3000 });
+        return `【写前简报】（由 ${parts.length} 项工程材料浓缩，原始材料共 ${materials.length} 字）\n\n${brief}`;
+      },
+    });
+
+    // ---------------- 28. 章后归档 ----------------
+    tool({
+      name: 'novel_archive',
+      description: '章后归档：章节写完后调用——提取本章事件更新时间线、更新伏笔清单状态、生成归档记录（章节摘要/人物状态变化/新增设定）。与 novel_briefing 组成「写前—写后」闭环，是长篇不断片的保障。',
+      timeoutMs: 300000,
+      parameters: {
+        ...routeParams,
+        chapter_number: { type: 'integer', description: '章节序号', required: true },
+        chapter_title: { type: 'string', description: '章节标题（可选）' },
+        content: { type: 'string', description: '本章正文（纯文本）', required: true },
+        update_foreshadow: { type: 'boolean', description: '是否更新伏笔清单.md，默认 true' },
+        update_timeline: { type: 'boolean', description: '是否更新时间线.md，默认 true' },
+      },
+      run: async (args, exec) => {
+        const fs = ctx.get('fs');
+        const sp = ctx.get('sandboxPolicy');
+        if (fs === undefined || sp === undefined) throw new Error('文件系统服务不可用');
+        const session = exec && exec.agent ? exec.agent.session : undefined;
+        const root = workspaceRoot(exec, sp);
+        const policy = sp.resolve(session !== undefined ? { session } : {});
+        const proj = openProject(fs, root, policy);
+        const body = args && typeof args.content === 'string' && args.content.trim() ? args.content.trim() : '';
+        if (!body) throw new Error('缺少本章正文（content）');
+        const num = args && args.chapter_number ? args.chapter_number : 1;
+        const ct = args && args.chapter_title ? args.chapter_title : '';
+        const foreshadow = await proj.readMaybe('伏笔清单.md', 4000);
+        const timeline = await proj.readMaybe('时间线.md', 2500);
+        const system = `${commonSystem}
+
+你现在担任网文连续性管理员，负责在章节定稿后维护作品工程。根据本章正文与现有工程记录，严格按以下分隔格式输出（四个分隔符各占一行、原样输出）：
+===FORESHADOW_TABLE===
+（更新后的完整伏笔清单 Markdown 表格，表头：| 伏笔 | 铺设位置 | 发酵 | 回收位置 | 状态 |。在现有表格基础上：本章铺设的新伏笔追加一行（状态：铺设中），本章推进/回收的更新其发酵与回收位置及状态（已回收），无变化的行原样保留；没有现有表格则新建并填入本章内容能确定的伏笔）
+===TIMELINE_ROWS===
+（本章新增的时间线行，每行一条：| 时间 | 事件 | 参与人物 | 影响/后续 |，时间用故事内相对时间；无新增写「无」）
+===ARCHIVE_REPORT===
+（① 本章摘要：150 字以内客观记录 ② 人物状态变化：逐条「人物：变化」，无则写「无」③ 新增设定要点：逐条，无则写「无」④ 遗留问题：本章未解决/需注意之处，无则写「无」）`;
+        const text = await generate(system, compose([
+          field(`本章正文（第${num}章${ct ? ' ' + ct : ''}）`, body),
+          field('现有伏笔清单', foreshadow),
+          field('现有时间线', timeline),
+        ]), args, exec, { maxTokens: 4000 });
+        const table = extractSection(text, 'FORESHADOW_TABLE');
+        const tlRows = extractSection(text, 'TIMELINE_ROWS');
+        const report = extractSection(text, 'ARCHIVE_REPORT');
+        const out = [];
+        const archiveFile = `归档/第${String(num).padStart(3, '0')}章${ct ? '-' + safeName(ct) : ''}-归档.md`;
+        if (!report && !table) {
+          // 模型没有按分隔格式输出：整体写入归档文件，不覆盖工程表
+          await proj.write(archiveFile, `# 第${num}章 归档\n\n${text}\n`);
+          return `已保存归档：${archiveFile}\n（警告：归档模型未按分隔格式输出，伏笔清单与时间线未更新；请人工核对）`;
+        }
+        if (args && args.update_foreshadow === false) {
+          out.push('伏笔清单：按参数跳过更新');
+        } else if (table) {
+          await proj.write('伏笔清单.md', `# 伏笔清单\n\n${table}\n`);
+          out.push('伏笔清单：已更新');
+        }
+        if (args && args.update_timeline === false) {
+          out.push('时间线：按参数跳过更新');
+        } else if (tlRows && tlRows !== '无') {
+          const existing = await proj.readMaybe('时间线.md');
+          const header = '# 时间线\n\n| 时间 | 事件 | 参与人物 | 影响/后续 |\n| --- | --- | --- | --- |\n';
+          const base = existing && existing.trim() ? `${existing.trimEnd()}\n` : header;
+          await proj.write('时间线.md', `${base}${tlRows}\n`);
+          out.push('时间线：已追加本章事件');
+        }
+        await proj.write(archiveFile, `# 第${num}章 归档${ct ? ' · ' + ct : ''}\n\n${report || text}\n`);
+        out.push(`归档记录：${archiveFile}`);
+        return compose([
+          `第${num}章归档完成：`,
+          ...out.map((l) => `- ${l}`),
+          '提示：人物状态变化若影响人物卡，请同步更新 人物卡/ 下对应文件。',
+        ]);
+      },
+    });
+
+    // ---------------- 29. 角色采访 ----------------
+    tool({
+      name: 'novel_interview',
+      description: '角色采访：让角色以第一人称接受采访，校准人设声音（口癖、语气、知识边界），深挖角色内心素材；支持压力测试。采访产出的「人声笔记」可回填人物卡，供正文保持人物一致性。',
+      timeoutMs: 180000,
+      parameters: {
+        ...routeParams,
+        character: { type: 'string', description: '人物卡/角色描述', required: true },
+        questions: { type: 'string', description: '采访问题（多条用换行分隔；不填则由采访者自动设计）' },
+        context: { type: 'string', description: '故事背景/当前剧情（角色以此为准回答，可选）' },
+        mode: { type: 'string', enum: ['轻松闲聊', '深度挖掘', '压力测试'], description: '采访模式，默认深度挖掘' },
+        count: { type: 'integer', description: '自动设计的问题数量，默认 6' },
+      },
+      system: (args) => `${commonSystem}
+
+你现在担任「角色采访」导演，同时扮演采访者与被采访的角色本人。
+
+规则：
+1. 角色全程第一人称入戏回答：严格符合人物卡的性格、口癖、语气、身份与说话方式；回答要像真人——有停顿、有回避、有情绪，不要像履历陈述。
+2. 知识边界：角色只知道 TA 在剧情中经历过、看到过、听说过的信息；不知道作者视角的设定与未来剧情，被问到时按角色的合理反应应对（困惑、回避、猜测）。
+3. 按「采访模式」调整：轻松闲聊（日常话题，暴露生活细节与趣味）、深度挖掘（追问动机、恐惧、欲望、关系与过往创伤）、压力测试（质疑角色动机、逼问两难与不堪往事，角色按性格真实反应——可以撒谎、暴怒、沉默，但要符合人设）。
+4. 问题设计要有梯度：由浅入深，覆盖性格、动机、关系与秘密；追问抓住回答中的矛盾点。
+
+输出格式（Markdown）：
+## 采访记录
+（问：…／答：… 逐条展开）
+## 人声笔记
+（总结该角色的语言特征：用词习惯、句式长短、口癖、情绪表达方式、绝不会说的话——可直接回填人物卡）
+## 一致性提醒
+（回答中与人设矛盾或值得注意之处；没有则写「未发现」）`,
+      user: (args) => compose([
+        field('人物卡/角色描述', args.character),
+        field('故事背景/当前剧情', args.context),
+        field('采访模式', args.mode),
+        args.questions ? `【采访问题】\n${args.questions}` : `【采访问题】由你设计 ${args.count || 6} 个问题，按上述模式与梯度展开`,
+      ]),
+      opts: { maxTokens: 6000 },
+    });
+
+    // ---------------- 30. 平台合规体检 ----------------
+    tool({
+      name: 'novel_compliance',
+      description: '平台合规体检：按中文网文平台的内容规范审查稿件，标记可能导致章节审核不通过/被屏蔽的风险点（分级+修改建议），可选输出保留剧情张力的合规改写版。上架/过审前使用。',
+      timeoutMs: 180000,
+      parameters: {
+        ...routeParams,
+        text: { type: 'string', description: '待检查的稿件', required: true },
+        platform: { type: 'string', enum: ['通用', '起点', '番茄', '晋江', '飞卢', '纵横'], description: '目标平台，默认通用' },
+        mode: { type: 'string', enum: ['仅风险报告', '报告+合规改写'], description: '工作模式，默认仅风险报告' },
+      },
+      system: (args) => `${commonSystem}
+
+你现在担任网文平台内容风控编辑，负责发布前体检。目标是帮作者顺利过审，同时保住剧情张力——给的是「怎么改能过」的方案，不是一刀切删除。
+
+检查类别：
+1. 色情低俗：露骨性描写、过度身体细节（平台尺度差异大：晋江/番茄严，起点/纵横相对宽松）。
+2. 暴力血腥：酷刑/虐杀的过程细节、血腥渲染过度。
+3. 涉政涉敏：真实政治人物/事件/机构的影射与讨论、敏感历史评价。
+4. 违法细节教学：可被模仿的作案、制毒、自杀等具体方法与步骤描写。
+5. 价值观风险：美化犯罪、宣扬仇恨、歧视性言论。
+6. 未成年人相关：未成年角色涉性涉暴内容。
+7. 侵权风险：真实人名/品牌/作品的不当使用、高度模仿知名桥段。
+
+输出格式（Markdown）：
+## 风险清单
+（每条：【位置】【类型】【等级：高/中/低】【修改建议】；按等级排序。没有风险的类别不用列；全文无风险时明确写「未发现明显风险，可正常发布」）
+## 整体结论
+（一句话：可发布 / 建议修改后发布 / 有封禁风险必须修改）${args && args.mode === '报告+合规改写' ? '\n\n## 合规改写版\n（保留剧情张力与信息量的前提下，把风险表达模糊化、艺术化或替代的改写全文）\n\n## 改写说明\n（逐处说明改了什么、为什么能过审）' : ''}`,
+      user: (args) => compose([
+        field('待检查稿件', args.text),
+        field('目标平台', args.platform),
+        field('工作模式', args.mode),
+      ]),
+      opts: { maxTokens: 6000 },
     });
 
     // ---------------- 创作方法论提示段 ----------------
@@ -1022,8 +1438,24 @@ export default {
 
 九、作品工程与落盘（Obsidian 友好）
 - 成果统一落盘 Markdown：大纲/设定集/人物卡用标题与列表；章节正文用纯文本、不加任何 markdown 符号。
-- 章节每章一个文件：正文/第001章-标题.md；重要伏笔记入 伏笔清单.md（铺设/发酵/回收状态表）。
-- 用 novel_project 工具初始化工程、保存章节、生成伏笔清单、整理索引；鼓励用户用 Obsidian 打开工作区阅读与批注。`,
+- 工程目录：正文/（每章一个文件：正文/第001章-标题.md）、大纲/、设定集/、人物卡/、归档/，以及 伏笔清单.md、时间线.md、README.md（索引）。
+- 用 novel_project 初始化工程、保存章节、生成伏笔清单、生成时间线、统计进度、整理索引；鼓励用户用 Obsidian 打开工作区阅读与批注。
+
+十、长篇连载循环（每章标准流程）
+- 写前：novel_briefing 生成写前简报（或先读大纲/人物卡/伏笔清单/最近归档），明确本章任务、出场人物、活跃伏笔与上文衔接；没有简报不动笔。
+- 成稿：优先 novel_write_chapter 单章成稿（草稿→自查→修订多稿流程），或 novel_scene_write / novel_continue 分场景推进；重要章节用「草稿+自查+修订」。
+- 自查：对照「去 AI 味」红线逐项过一遍；检查开头是否紧接上文、结尾钩子是否成立、人物言行是否符合人物卡。
+- 归档：novel_archive 更新伏笔清单、时间线与归档记录；novel_project 整理索引。人物状态变化同步回写人物卡。
+- 断更恢复：隔了很久或新会话续写时，先读最近归档、伏笔清单与上一章结尾找回状态，再动笔。
+
+十一、一致性守则
+- 人物卡先查后写：出场角色的性格、口癖、关系、状态以人物卡与最近归档为准；新信息写完即回填。
+- 新设定先入设定集再进正文；战力、等级、时间线、人物年龄必须对齐，越强限制越多。
+- 伏笔必登记：铺设即记入伏笔清单（状态：铺设中），发酵与回收及时更新，回收即销账；每卷末清点未回收伏笔，防止烂尾。
+
+十二、节奏量化参考
+- 单章 2000-4000 字为宜；每章至少一个情绪点；连续 3 章无爽点即为拖沓；每 3-5 章一个小高潮，每卷末一个大高潮并留跨卷钩子。
+- 开篇黄金三章决定留存；中段用支线、升级与新地图调节奏；大高潮后安排 1-2 章缓冲再开新冲突。`,
     }));
 
     return () => { for (const d of disposers) d(); };
