@@ -1,4 +1,4 @@
-# DSH-Novel · AI 网文写作环境
+# DSH-Novel · AI 写作
 
 > 一个 Agent 预设，把 DeepSeek Harness 变成「AI 写小说」工作台：**30 个网文写作工具 + 完整网文创作方法论**，全部随「小说助手」预设内置、持久可用，**无需额外安装任何插件**。
 > 把本仓库（或 GitHub 链接）交给任意 DeepSeek Harness Agent，按 `INSTALL.md` 执行即可自动安装完成。
