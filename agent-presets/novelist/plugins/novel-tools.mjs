@@ -1428,6 +1428,230 @@ ${kindRule}
       opts: { maxTokens: 6000 },
     });
 
+    // ---------------- 31. 模拟读者团 ----------------
+    tool({
+      name: 'novel_reader_panel',
+      description: '模拟读者团试读：组织多位典型网文读者（快节奏白嫖党、付费老书虫、题材新读者、逻辑挑刺型等）读完章节，给出真实读者视角的反馈——哪里爽、哪里想弃书、哪里看不懂、会不会追更，并汇总最该改的问题。发布前试读用，弥补作者视角的盲区。',
+      timeoutMs: 180000,
+      parameters: {
+        ...routeParams,
+        text: { type: 'string', description: '待试读的章节/片段', required: true },
+        genre: { type: 'string', description: '题材/平台（帮助贴近真实读者群，可选）' },
+        persona_count: { type: 'integer', description: '读者人数，3-6，默认 4' },
+      },
+      system: (args) => `${commonSystem}
+
+你现在组织一场「模拟读者团」试读会。你不是编辑——编辑看稿看的是技术；读者看的是爽不爽、追不追。你要完全代入读者视角，说读者的糙话，不打官腔。
+
+读者团成员（按 persona_count 取前 N 个，默认 4）：
+1. 快节奏白嫖党：手机上划得飞快，三行没爽点就退出去；说话直接：「这段磨叽了」「这里爽到了」。
+2. 付费老书虫：同题材追过几十本，套路全见过，最烦注水和降智；会拿别的书对比：「人家XX书这段是这么写的」。
+3. 题材新读者：第一次看这类书，前情不熟；会问「这人是谁」「这设定啥意思」（前情不清就是问题）。
+4. 逻辑挑刺型：专抓人物降智、前后矛盾、行为不合理；说话不客气但说的都是实的。
+5.（可加）女性向/男性向读者：按题材选择。
+
+输出格式（Markdown）：
+## 读者反馈
+（每位读者一小节：【身份】+ 三五句大白话反馈，标出【爽点】【无聊点/想弃书处】【看不懂处】【追更意愿：追/弃/观望】。引用原文位置。反馈要具体到段落，不要笼统）
+## 汇总
+（最该改的 3 个问题，按严重度排序，各配一句修改方向；最后给一句「会不会追更」的总体判断）`,
+      user: (args) => compose([
+        field('待试读章节', args.text),
+        field('题材/平台', args.genre),
+        args.persona_count ? `【读者人数】${args.persona_count} 人` : '',
+      ]),
+      opts: { maxTokens: 6000 },
+    });
+
+    // ---------------- 32. 旧稿导入 ----------------
+    tool({
+      name: 'novel_import',
+      description: '旧稿导入：把已有小说存稿一键接入作品工程——自动按「第X章」标记分章、逐章落盘到 正文/，并用模型从全文逆推大纲、人物卡与设定集写入工程。适合把存量作品（txt 整书、导出章节）纳入工程化管理后开始 AI 辅助连载。',
+      timeoutMs: 600000,
+      parameters: {
+        ...routeParams,
+        text: { type: 'string', description: '旧稿全文（含「第X章」等章节标记的长文本）', required: true },
+        title: { type: 'string', description: '作品名（写入索引，可选）' },
+        chapter_number: { type: 'integer', description: '起始章号（默认 1，已有章节续接时改这里）' },
+        reverse: { type: 'boolean', description: '是否逆推大纲/人物卡/设定集（默认 true）' },
+      },
+      run: async (args, exec) => {
+        const fs = ctx.get('fs');
+        const sp = ctx.get('sandboxPolicy');
+        if (fs === undefined || sp === undefined) throw new Error('文件系统服务不可用');
+        const session = exec && exec.agent ? exec.agent.session : undefined;
+        const policy = sp.resolve(session !== undefined ? { session } : {});
+        const root = workspaceRoot(exec, sp);
+        const text = args && typeof args.text === 'string' ? args.text : '';
+        if (!text.trim()) throw new Error('缺少旧稿文本（text）');
+        const start = args && args.chapter_number ? args.chapter_number : 1;
+
+        // 1) 分章：以独立的「第X章/回/节 标题」行为界
+        const headingRe = /^第[0-9零一二三四五六七八九十百千两]+[章回节].{0,30}$/;
+        const chapters = [];
+        let cur = null;
+        for (const raw of text.split('\n')) {
+          const line = raw.trim();
+          if (headingRe.test(line)) {
+            if (cur) chapters.push(cur);
+            cur = { title: line, body: [] };
+          } else {
+            if (!cur) cur = { title: '', body: [] };
+            cur.body.push(raw);
+          }
+        }
+        if (cur) chapters.push(cur);
+        const real = chapters.filter((c) => (c.body.join('\n').trim().length > 0) || c.title);
+        if (!real.length) throw new Error('未能识别出任何章节，请确认文本包含「第X章」类章节标记');
+
+        // 2) 逐章落盘（文件名去掉原「第X章」前缀，按新序号重排）
+        const saved = [];
+        for (let i = 0; i < real.length; i++) {
+          const body = real[i].body.join('\n').trim();
+          if (!body && !real[i].title) continue;
+          if (!body) continue;
+          const cleanTitle = real[i].title.replace(/^第[0-9零一二三四五六七八九十百千两]+[章回节]\s*[:：、.\-—]?\s*/, '');
+          const file = await saveChapterFile(fs, root, policy, start + saved.length, cleanTitle, body);
+          saved.push(file);
+        }
+        const out = [`已导入 ${saved.length} 章到 正文/（第${start}章起）`];
+
+        // 3) 逆推工程材料（抽样限额，防超长）
+        if (args && args.reverse === false) {
+          out.push('已跳过逆推（reverse=false）');
+        } else {
+          const CAP = 48000;
+          const sample = text.length > CAP
+            ? `${text.slice(0, 30000)}\n…（中略）\n${text.slice(-15000)}`
+            : text;
+          const note = text.length > CAP ? '（材料过长已抽样，建议导入后人工补全）' : '';
+          const gen = async (sys, label) => generate(sys, `【旧稿全文${note}】\n${sample}`, args, exec, { maxTokens: 5000 });
+          const outlineSys = `${commonSystem}\n\n你现在担任网文结构编辑。通读旧稿，逆推一份结构化大纲（Markdown）：分卷-分章列出每章主要事件、转折与钩子；标注推断出的主线/支线。只依据文本内容，不臆造。`;
+          const charSys = `${commonSystem}\n\n你现在担任角色分析师。通读旧稿，为主要出场人物各建一张人物卡（Markdown，一人一节）：基本信息、性格与口癖、动机、关系、当前状态（以文本末尾为准）。只依据文本内容。`;
+          const setSys = `${commonSystem}\n\n你现在担任设定考古员。通读旧稿，把文本中出现的世界观设定整理成设定集（Markdown）：力量/等级体系、地理与势力、重要规则与代价、时间线要点。只依据文本内容，不臆造。`;
+          const [outline, chars, sets] = [
+            await gen(outlineSys),
+            await gen(charSys),
+            await gen(setSys),
+          ];
+          const writeFile = async (rel, head, body) => {
+            const target = await fs.resolve(rel, { cwd: root });
+            await fs.writeText(target, head + '\n\n' + body, undefined, undefined, policy);
+          };
+          await writeFile('大纲/逆推大纲.md', '# 逆推大纲（novel_import 自旧稿生成）', outline);
+          await writeFile('人物卡/逆推人物卡.md', '# 逆推人物卡（novel_import 自旧稿生成）', chars);
+          await writeFile('设定集/逆推设定集.md', '# 逆推设定集（novel_import 自旧稿生成）', sets);
+          out.push('已逆推并写入：大纲/逆推大纲.md、人物卡/逆推人物卡.md、设定集/逆推设定集.md');
+          if (note) out.push(note);
+        }
+        if (args && args.title) {
+          const listLines = saved.map((f) => '- [[' + f.replace(/^正文\//, '').replace(/\.md$/, '') + ']]').join('\n');
+          const readme = '# ' + args.title + '\n\n> 作品索引（由 novel_project 维护；旧稿由 novel_import 导入）\n\n- 章节数：' + saved.length + '\n\n## 章节\n\n' + listLines + '\n';
+          const target = await fs.resolve('README.md', { cwd: root });
+          await fs.writeText(target, readme, undefined, undefined, policy);
+          out.push('已更新索引：README.md');
+        }
+        return out.join('\n');
+      },
+    });
+
+    // ---------------- 33. 全书体检 ----------------
+    tool({
+      name: 'novel_scan_book',
+      description: '全书体检：直接读取作品工程（人物卡/设定集/伏笔清单/大纲 + 正文章节），做跨章一致性扫描与 AI 重复检测——人物言行矛盾、时间线错位、设定冲突、战力崩坏、伏笔遗忘，以及跨章重复的套路句/比喻/反应动作。不用粘贴文本，工程在手即扫；连载中期定期跑一次。',
+      timeoutMs: 600000,
+      parameters: {
+        ...routeParams,
+        scope: { type: 'string', enum: ['最近章节', '全书抽样'], description: '扫描范围，默认最近章节' },
+        chapter_count: { type: 'integer', description: '纳入扫描的章数（1-12），默认 5' },
+        focus: { type: 'array', items: { type: 'string', enum: ['人物一致性', '时间线', '设定冲突', '战力体系', '伏笔遗忘', '跨章重复'] }, description: '检查重点，默认全部' },
+      },
+      run: async (args, exec) => {
+        const fs = ctx.get('fs');
+        const sp = ctx.get('sandboxPolicy');
+        if (fs === undefined || sp === undefined) throw new Error('文件系统服务不可用');
+        const session = exec && exec.agent ? exec.agent.session : undefined;
+        const policy = sp.resolve(session !== undefined ? { session } : {});
+        const root = workspaceRoot(exec, sp);
+        const proj = openProject(fs, root, policy);
+
+        // 选章
+        const names = await proj.listMd('正文');
+        const parsed = names
+          .map((n) => ({ n, num: parseInt((n.match(/^第(\d+)章/) || [])[1], 10) }))
+          .filter((c) => !Number.isNaN(c.num));
+        if (!parsed.length) throw new Error('正文/ 下没有可扫描的章节文件，请先保存或导入章节');
+        parsed.sort((a, b) => a.num - b.num);
+        const count = args && args.chapter_count ? Math.max(1, Math.min(12, args.chapter_count)) : 5;
+        const scope = args && args.scope === '全书抽样' ? '全书抽样' : '最近章节';
+        let picked;
+        if (scope === '全书抽样' && parsed.length > 4) {
+          const head = parsed.slice(0, 2);
+          const tail = parsed.slice(-Math.max(count - 3, 1));
+          const mid = [parsed[Math.floor(parsed.length / 2)]];
+          picked = [...head, ...mid, ...tail];
+        } else {
+          picked = parsed.slice(-count);
+        }
+        const seen = new Set();
+        const chapters = [];
+        for (const p of picked) {
+          if (seen.has(p.n)) continue;
+          seen.add(p.n);
+          const t = await proj.readMaybe(`正文/${p.n}`, 9000);
+          if (t) chapters.push(`### ${p.n}\n${t}`);
+        }
+
+        // 工程材料
+        const readDir = async (dir, cap, maxFiles) => {
+          const files = await proj.listMd(dir);
+          const parts = [];
+          for (const f of files.slice(0, maxFiles)) {
+            const t = await proj.readMaybe(`${dir}/${f}`, cap);
+            if (t) parts.push(`### ${dir}/${f}\n${t}`);
+          }
+          return parts.join('\n\n');
+        };
+        const [chars, sets, outline, foreshadow] = await Promise.all([
+          readDir('人物卡', 2500, 6),
+          readDir('设定集', 2500, 6),
+          readDir('大纲', 2500, 4),
+          proj.readMaybe('伏笔清单.md', 2500),
+        ]);
+
+        const system = `${commonSystem}
+
+你现在担任长篇连贯性审稿编辑，对「正文章节」做跨章体检，材料包括工程文件与正文章节。
+
+逐项检查（按「检查重点」执行，默认全部）：
+1. 人物一致性：言行、口癖、关系、状态与人物卡/前文是否矛盾；是否降智。
+2. 时间线：事件先后、时长、年龄与时间线.md 是否错位。
+3. 设定冲突：力量/等级/规则与设定集前后矛盾。
+4. 战力体系：强弱表现是否崩坏、越级是否合理。
+5. 伏笔遗忘：伏笔清单中「铺设中/发酵中」的伏笔是否长期未被提及（对照章节范围说明）。
+6. 跨章重复：多章反复出现的同一套路句、同一比喻、同一反应动作（AI 通病）——列出来源章节。
+
+输出格式（Markdown）：
+## 问题清单
+（每条：【位置/章节】【类型】【问题描述】【严重度：高/中/低】【修复建议】；按严重度排序）
+## 跨章重复清单
+（重复的表达 + 出现章节列表 + 替换建议；无则写「未发现明显重复」）
+## 总体结论
+（一句话健康度评价 + 下一步建议）`;
+
+        const user = compose([
+          chars ? field('人物卡（工程材料）', chars) : '（人物卡为空）',
+          sets ? field('设定集（工程材料）', sets) : '（设定集为空）',
+          outline ? field('大纲（工程材料）', outline) : '（大纲为空）',
+          foreshadow ? field('伏笔清单', foreshadow) : '（伏笔清单为空）',
+          field('检查重点', pick(args && args.focus, ['人物一致性', '时间线', '设定冲突', '战力体系', '伏笔遗忘', '跨章重复'])),
+          `【扫描范围】${scope}（共 ${chapters.length} 章：${[...seen].join('、')}）`,
+          field('正文章节', chapters.join('\n\n')),
+        ]);
+        return generate(system, user, args, exec, { maxTokens: 7000 });
+      },
+    });
+
     // ---------------- 创作方法论提示段 ----------------
     // 随预设注入 systemPrompt，确保即使 novel_* 工具不可用，Agent 也具备
     // 完整的网文创作方法论，可独立完成同等质量的创作任务。
@@ -1472,12 +1696,14 @@ ${kindRule}
 - 成果统一落盘 Markdown：大纲/设定集/人物卡用标题与列表；章节正文用纯文本、不加任何 markdown 符号。
 - 工程目录：正文/（每章一个文件：正文/第001章-标题.md）、大纲/、设定集/、人物卡/、归档/，以及 伏笔清单.md、时间线.md、README.md（索引）。
 - 用 novel_project 初始化工程、保存章节、生成伏笔清单、生成时间线、统计进度、整理索引；鼓励用户用 Obsidian 打开工作区阅读与批注。
+- 存量旧稿用 novel_import 一键导入（自动分章落盘，并逆推大纲/人物卡/设定集）；连载中期定期用 novel_scan_book 做全书体检（跨章矛盾 + 跨章重复检测）。
 
 十、长篇连载循环（每章标准流程）
 - 写前：novel_briefing 生成写前简报（或先读大纲/人物卡/伏笔清单/最近归档），明确本章任务、出场人物、活跃伏笔与上文衔接；没有简报不动笔。
 - 成稿：优先 novel_write_chapter 单章成稿（草稿→自查→修订多稿流程），或 novel_scene_write / novel_continue 分场景推进；重要章节用「草稿+自查+修订」。
 - 自查：成稿时已按红线边写边防，此处只做整篇兜底快扫；同时检查开头是否紧接上文、结尾钩子是否成立、人物言行是否符合人物卡。
 - 归档：novel_archive 更新伏笔清单、时间线与归档记录；novel_project 整理索引。伏笔清单、时间线、人物状态三项**每章必须同步更新**——缺一项不算完成归档，下一章的简报就可能建立在过期信息上；长篇一致性靠这三份随写随更的工程文件兜底，不靠模型记忆硬扛。
+- 发布前（可选）：novel_reader_panel 模拟读者团试读本章，按读者反馈微调；上架章节另做 novel_compliance 合规体检。
 - 断更恢复：隔了很久或新会话续写时，先读最近归档、伏笔清单与上一章结尾找回状态，再动笔。
 
 十一、一致性守则
