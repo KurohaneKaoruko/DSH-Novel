@@ -514,8 +514,10 @@ export default {
         premise: { type: 'string', description: '核心设定/故事前提（可选）' },
         aspect: { type: 'array', items: { type: 'string', enum: ['力量体系', '地理格局', '势力组织', '历史脉络', '文化民俗', '科技水平', '经济体系', '社会规则'] }, description: '构建模块，默认力量体系+地理格局+势力组织' },
         depth: { type: 'string', enum: ['简略', '标准', '详尽'], description: '详细程度，默认标准' },
+        save: { type: 'boolean', description: '是否保存进作品工程（每类一文件：设定集/分类.md），默认 false' },
       },
-      system: (args) => `${commonSystem}
+      run: async (args, exec) => {
+        const system = `${commonSystem}
 
 你现在担任世界观构建师，负责设计自洽且有延展性的小说世界观。
 
@@ -523,14 +525,48 @@ export default {
 1. 按「构建模块」逐一设计，模块之间互相呼应、逻辑自洽。
 2. 力量/规则体系必须有清晰的边界与代价（越强限制越多），避免无敌与崩坏。
 3. 每个模块给出：核心规则 → 关键设定条目 → 对剧情的可用性提示（哪些设定可以当钩子/冲突源）。
-4. 按「详细程度」控制篇幅；输出结构化文档，善用列表与表格。`,
-      user: (args) => compose([
-        field('题材类型', args.genre),
-        field('核心前提', args.premise),
-        field('构建模块', pick(args.aspect, ['力量体系', '地理格局', '势力组织'])),
-        field('详细程度', args.depth),
-      ]),
-      opts: { maxTokens: 6000 },
+4. 按「详细程度」控制篇幅；输出结构化文档，善用列表与表格。
+5. 输出格式：每个模块用「## 模块名」做二级标题开头（保存时按此分文件）。模块之间用双链互相关联（如 [[设定集/力量体系]]、[[设定集/地理]]），涉及角色用 [[角色名]]。`;
+        const user = compose([
+          field('题材类型', args.genre),
+          field('核心前提', args.premise),
+          field('构建模块', pick(args.aspect, ['力量体系', '地理格局', '势力组织'])),
+          field('详细程度', args.depth),
+        ]);
+        const result = await generate(system, user, args, exec, { maxTokens: 6000 });
+        if (!args || args.save !== true) return result;
+        const fs = ctx.get('fs');
+        const sp = ctx.get('sandboxPolicy');
+        if (fs === undefined || sp === undefined) return result + '\n\n（文件系统不可用，未能保存进工程）';
+        const session = exec && exec.agent ? exec.agent.session : undefined;
+        const root = workspaceRoot(exec, sp);
+        const policy = sp.resolve(session !== undefined ? { session } : {});
+        const sections = result.split(/\n(?=## )/);
+        const saved = [];
+        for (const sec of sections) {
+          const m = sec.match(/^## (.+)$/m);
+          if (!m) continue;
+          const name = safeName(m[1].trim());
+          if (!name) continue;
+          const target = await fs.resolve(`设定集/${name}.md`, { cwd: root });
+          await fs.writeText(target, sec.trim() + '\n', undefined, undefined, policy);
+          saved.push(`设定集/${name}.md`);
+        }
+        // 更新索引
+        const listMd = async (dir) => {
+          try {
+            const t = await fs.resolve(dir, { cwd: root });
+            const es = await fs.listDir(t);
+            return es.filter((e) => e.type === 'file' && /\.md$/.test(e.name) && e.name !== '_索引.md' && e.name !== '说明.md').map((e) => e.name).sort();
+          } catch (e) { return []; }
+        };
+        const allSets = await listMd('设定集');
+        if (allSets.length > 0) {
+          const idxTarget = await fs.resolve('设定集/_索引.md', { cwd: root });
+          await fs.writeText(idxTarget, `# 设定集索引\n\n> 每类设定一个文件；与人物卡用双链互相关联\n\n${allSets.map((s) => `- [[设定集/${s.replace(/\.md$/, '')}|${s.replace(/\.md$/, '')}]]`).join('\n')}\n`, undefined, undefined, policy);
+        }
+        return result + '\n\n---\n已保存 ' + saved.length + ' 个设定文件：' + saved.join('、');
+      },
     });
 
     // ---------------- 10. 角色设计 ----------------
@@ -545,8 +581,10 @@ export default {
         archetype: { type: 'string', description: '原型/标签，如「废柴逆袭」「高冷男神」（可选）' },
         story: { type: 'string', description: '故事背景（可选）' },
         count: { type: 'integer', description: '生成角色数量，默认 1' },
+        save: { type: 'boolean', description: '是否保存进作品工程（每人一文件：人物卡/角色名.md），默认 false' },
       },
-      system: (args) => `${commonSystem}
+      run: async (args, exec) => {
+        const system = `${commonSystem}
 
 你现在担任角色设计专家，负责塑造立体、有记忆点的小说角色。
 
@@ -554,15 +592,50 @@ export default {
 1. 每个角色包含：基本信息（姓名/年龄/身份/外貌）、性格（3-5 个核心特质 + 1-2 个内在矛盾）、动机（欲望/目标 + 恐惧）、能力与限制、人物弧光（初始状态→关键变化→终态）、口头禅与习惯动作、台词风格、关键关系、弱点与黑历史。
 2. 反派也要有自洽动机，不脸谱化；配角要有独立欲望。
 3. 角色要「可用」：每个特质都能转化为剧情冲突或看点。
-4. 一次生成多个角色时，彼此差异化、关系可交织。`,
-      user: (args) => compose([
-        field('角色定位', args.role),
-        field('已有特征/关键词', args.traits),
-        field('原型/标签', args.archetype),
-        field('故事背景', args.story),
-        args.count ? `【生成数量】${args.count} 个` : '',
-      ]),
-      opts: { maxTokens: 6000 },
+4. 一次生成多个角色时，彼此差异化、关系可交织。
+5. 输出格式：每个角色用「## 角色名」做二级标题开头（保存时按此分文件）。角色之间的关系用双链 [[对方角色名]] 标注。`;
+        const user = compose([
+          field('角色定位', args.role),
+          field('已有特征/关键词', args.traits),
+          field('原型/标签', args.archetype),
+          field('故事背景', args.story),
+          args.count ? `【生成数量】${args.count} 个` : '',
+        ]);
+        const result = await generate(system, user, args, exec, { maxTokens: 6000 });
+        if (!args || args.save !== true) return result;
+        // 保存：按「## 角色名」拆分为每人一文件
+        const fs = ctx.get('fs');
+        const sp = ctx.get('sandboxPolicy');
+        if (fs === undefined || sp === undefined) return result + '\n\n（文件系统不可用，未能保存进工程）';
+        const session = exec && exec.agent ? exec.agent.session : undefined;
+        const root = workspaceRoot(exec, sp);
+        const policy = sp.resolve(session !== undefined ? { session } : {});
+        const sections = result.split(/\n(?=## )/);
+        const saved = [];
+        for (const sec of sections) {
+          const m = sec.match(/^## (.+)$/m);
+          if (!m) continue;
+          const name = safeName(m[1].trim());
+          if (!name) continue;
+          const target = await fs.resolve(`人物卡/${name}.md`, { cwd: root });
+          await fs.writeText(target, sec.trim() + '\n', undefined, undefined, policy);
+          saved.push(`人物卡/${name}.md`);
+        }
+        // 更新索引
+        const listMd = async (dir) => {
+          try {
+            const t = await fs.resolve(dir, { cwd: root });
+            const es = await fs.listDir(t);
+            return es.filter((e) => e.type === 'file' && /\.md$/.test(e.name) && e.name !== '_索引.md' && e.name !== '说明.md').map((e) => e.name).sort();
+          } catch (e) { return []; }
+        };
+        const allChars = await listMd('人物卡');
+        if (allChars.length > 0) {
+          const idxTarget = await fs.resolve('人物卡/_索引.md', { cwd: root });
+          await fs.writeText(idxTarget, `# 人物卡索引\n\n> 每个角色一个文件；关系用双链互链\n\n${allChars.map((c) => `- [[人物卡/${c.replace(/\.md$/, '')}|${c.replace(/\.md$/, '')}]]`).join('\n')}\n`, undefined, undefined, policy);
+        }
+        return result + '\n\n---\n已保存 ' + saved.length + ' 个角色文件：' + saved.join('、');
+      },
     });
 
     // ---------------- 11. 章节规划 ----------------
@@ -1044,15 +1117,19 @@ ${kindRule}
         const out = [];
         if (action === '初始化工程') {
           const t = args && args.title ? args.title : '未命名作品';
-          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护）\n\n- 简介：\n- 状态：\n- 章节：见 \`正文/\`\n- 伏笔：见 \`伏笔清单.md\`\n- 时间线：见 \`时间线.md\`\n`);
+          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护，双链导航）\n\n- 简介：\n- 状态：\n\n## 快速导航\n\n- [[伏笔清单]] · [[时间线]] · [[大纲/总纲|总纲]]\n- [[人物卡/_索引|人物卡]] · [[设定集/_索引|设定集]]\n- 章节：见下方（整理索引后自动生成）\n`);
           await write('伏笔清单.md', `# 伏笔清单\n\n| 伏笔 | 铺设位置 | 发酵 | 回收位置 | 状态 |\n| --- | --- | --- | --- | --- |\n`);
           await write('时间线.md', `# 时间线\n\n| 时间 | 事件 | 参与人物 | 影响/后续 |\n| --- | --- | --- | --- |\n`);
-          await write('大纲/说明.md', '# 大纲\n\n分卷-章节大纲（Markdown 结构）\n');
-          await write('设定集/说明.md', '# 设定集\n\n世界观、力量体系、地理、势力等设定（Markdown 结构）\n');
-          await write('人物卡/说明.md', '# 人物卡\n\n每个角色一个文件或一段（Markdown 结构）\n');
-          await write('归档/说明.md', '# 归档\n\n每章写完的状态归档（由 novel_archive 生成）：第NNN章-归档.md，含章节摘要、人物状态变化、新增设定\n');
-          await write('正文/说明.md', '# 正文\n\n每章一个文件：`第001章-标题.md`，正文为纯文本、不加 markdown 符号\n');
-          out.push('已初始化工程：README.md、伏笔清单.md、时间线.md、大纲/、设定集/、人物卡/、归档/、正文/');
+          await write('大纲/总纲.md', '# 总纲\n\n## 核心设定\n\n## 主线\n\n## 分卷规划\n');
+          await write('设定集/_索引.md', '# 设定集索引\n\n> 每类设定一个文件；文件之间与人物卡用双链互相关联（如 [[主角]]、[[设定集/力量体系|力量体系]]）\n\n');
+          await write('设定集/世界观.md', '# 世界观\n\n（核心世界观设定；相关链接：[[设定集/力量体系]]、[[设定集/地理]]）\n');
+          await write('设定集/力量体系.md', '# 力量体系\n\n（等级/功法/战力规则与代价）\n');
+          await write('设定集/地理.md', '# 地理\n\n（大陆/国家/城市/重要地点）\n');
+          await write('设定集/势力.md', '# 势力\n\n（宗门/家族/组织/阵营）\n');
+          await write('人物卡/_索引.md', '# 人物卡索引\n\n> 每个角色一个文件；关系用双链互链（如 [[林远]]），设定关联用 [[设定集/xxx]]\n\n');
+          await write('归档/说明.md', '# 归档\n\n每章归档一个文件：第NNN章-归档.md（由 novel_archive 生成）\n');
+          await write('正文/说明.md', '# 正文\n\n每章一个文件：`第NNN章-标题.md`\n');
+          out.push('已初始化工程（每人一文件 + 设定分类 + 双链索引）：README.md、伏笔清单、时间线、大纲/总纲、设定集/（世界观/力量体系/地理/势力/_索引）、人物卡/_索引、归档/、正文/');
         } else if (action === '保存章节') {
           const num = args && args.chapter_number ? args.chapter_number : 1;
           const body = args && typeof args.content === 'string' && args.content.trim() ? args.content : '';
@@ -1104,8 +1181,23 @@ ${kindRule}
         } else if (action === '整理索引') {
           const t = args && args.title ? args.title : '未命名作品';
           const chapters = await proj.listMd('正文');
-          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护）\n\n- 简介：\n- 状态：\n- 章节数：${chapters.length}\n\n## 章节\n\n${chapters.map((c) => `- [[${c.replace(/\.md$/, '')}]]`).join('\n') || '（暂无章节）'}\n\n- 伏笔：见 [[伏笔清单]]\n- 时间线：见 [[时间线]]\n`);
-          out.push(`已整理索引：README.md（${chapters.length} 章）`);
+          const chars = await proj.listMd('人物卡');
+          const sets = await proj.listMd('设定集');
+          const arcs = await proj.listMd('归档');
+          const skip = (f) => f !== '_索引.md' && f !== '说明.md';
+          const chapterLinks = chapters.map((c) => `- [[${c.replace(/\.md$/, '')}]]`).join('\n');
+          const charLinks = chars.filter(skip).map((c) => `- [[人物卡/${c.replace(/\.md$/, '')}|${c.replace(/\.md$/, '')}]]`).join('\n');
+          const setLinks = sets.filter(skip).map((s) => `- [[设定集/${s.replace(/\.md$/, '')}|${s.replace(/\.md$/, '')}]]`).join('\n');
+          const arcLinks = arcs.filter(skip).map((a) => `- [[归档/${a.replace(/\.md$/, '')}|${a.replace(/\.md$/, '')}]]`).join('\n');
+          await write('README.md', `# ${t}\n\n> 作品索引（由 novel_project 维护）\n\n- 简介：\n- 状态：\n- 章节数：${chapters.length}\n\n## 章节\n\n${chapterLinks || '（暂无）'}\n\n## 人物\n\n${charLinks || '（暂无）'}\n\n## 设定\n\n${setLinks || '（暂无）'}\n\n## 归档\n\n${arcLinks || '（暂无）'}\n\n## 追踪\n\n- [[伏笔清单]] · [[时间线]] · [[大纲/总纲|总纲]]\n`);
+          // 同步更新人物卡索引
+          if (chars.filter(skip).length > 0) {
+            await write('人物卡/_索引.md', `# 人物卡索引\n\n> 每个角色一个文件；关系用双链互链（如 [[林远]]）\n\n${chars.filter(skip).map((c) => `- [[人物卡/${c.replace(/\.md$/, '')}|${c.replace(/\.md$/, '')}]]`).join('\n')}\n`);
+          }
+          if (sets.filter(skip).length > 0) {
+            await write('设定集/_索引.md', `# 设定集索引\n\n> 每类设定一个文件；与人物卡用双链互相关联\n\n${sets.filter(skip).map((s) => `- [[设定集/${s.replace(/\.md$/, '')}|${s.replace(/\.md$/, '')}]]`).join('\n')}\n`);
+          }
+          out.push(`已整理索引：README.md（${chapters.length} 章、${chars.filter(skip).length} 人物、${sets.filter(skip).length} 设定，全部双链）`);
         } else {
           throw new Error(`未知操作：${action}`);
         }
@@ -1527,21 +1619,48 @@ ${kindRule}
           const note = text.length > CAP ? '（材料过长已抽样，建议导入后人工补全）' : '';
           const gen = async (sys, label) => generate(sys, `【旧稿全文${note}】\n${sample}`, args, exec, { maxTokens: 5000 });
           const outlineSys = `${commonSystem}\n\n你现在担任网文结构编辑。通读旧稿，逆推一份结构化大纲（Markdown）：分卷-分章列出每章主要事件、转折与钩子；标注推断出的主线/支线。只依据文本内容，不臆造。`;
-          const charSys = `${commonSystem}\n\n你现在担任角色分析师。通读旧稿，为主要出场人物各建一张人物卡（Markdown，一人一节）：基本信息、性格与口癖、动机、关系、当前状态（以文本末尾为准）。只依据文本内容。`;
-          const setSys = `${commonSystem}\n\n你现在担任设定考古员。通读旧稿，把文本中出现的世界观设定整理成设定集（Markdown）：力量/等级体系、地理与势力、重要规则与代价、时间线要点。只依据文本内容，不臆造。`;
+          const charSys = `${commonSystem}\n\n你现在担任角色分析师。通读旧稿，为主要出场人物各建一张人物卡：每人用「## 角色名」做二级标题开头，包含基本信息、性格与口癖、动机、关系（用双链 [[对方名]]）、当前状态（以文本末尾为准）。只依据文本内容。`;
+          const setSys = `${commonSystem}\n\n你现在担任设定考古员。通读旧稿，把文本中出现的世界观设定按类别整理：每类用「## 类别名」做二级标题开头（如力量体系、地理、势力），类别之间用双链互相关联。只依据文本内容，不臆造。`;
           const [outline, chars, sets] = [
             await gen(outlineSys),
             await gen(charSys),
             await gen(setSys),
           ];
-          const writeFile = async (rel, head, body) => {
+          const writeFile = async (rel, body) => {
             const target = await fs.resolve(rel, { cwd: root });
-            await fs.writeText(target, head + '\n\n' + body, undefined, undefined, policy);
+            await fs.writeText(target, body.trim() + '\n', undefined, undefined, policy);
           };
-          await writeFile('大纲/逆推大纲.md', '# 逆推大纲（novel_import 自旧稿生成）', outline);
-          await writeFile('人物卡/逆推人物卡.md', '# 逆推人物卡（novel_import 自旧稿生成）', chars);
-          await writeFile('设定集/逆推设定集.md', '# 逆推设定集（novel_import 自旧稿生成）', sets);
-          out.push('已逆推并写入：大纲/逆推大纲.md、人物卡/逆推人物卡.md、设定集/逆推设定集.md');
+          await writeFile('大纲/总纲.md', '# 总纲（novel_import 逆推）\n\n' + outline);
+          // 人物卡：按「## 角色名」拆分为每人一文件
+          const charSections = chars.split(/\n(?=## )/);
+          const charFiles = [];
+          for (const sec of charSections) {
+            const m = sec.match(/^## (.+)$/m);
+            if (!m) continue;
+            const name = safeName(m[1].trim());
+            if (!name) continue;
+            await writeFile(`人物卡/${name}.md`, sec.trim());
+            charFiles.push(name);
+          }
+          // 设定集：按「## 类别名」拆分为每类一文件
+          const setSections = sets.split(/\n(?=## )/);
+          const setFiles = [];
+          for (const sec of setSections) {
+            const m = sec.match(/^## (.+)$/m);
+            if (!m) continue;
+            const name = safeName(m[1].trim());
+            if (!name) continue;
+            await writeFile(`设定集/${name}.md`, sec.trim());
+            setFiles.push(name);
+          }
+          // 更新索引
+          if (charFiles.length > 0) {
+            await writeFile('人物卡/_索引.md', `# 人物卡索引\n\n> 每个角色一个文件；关系用双链互链\n\n${charFiles.map((n) => `- [[人物卡/${n}|${n}]]`).join('\n')}\n`);
+          }
+          if (setFiles.length > 0) {
+            await writeFile('设定集/_索引.md', `# 设定集索引\n\n> 每类设定一个文件\n\n${setFiles.map((n) => `- [[设定集/${n}|${n}]]`).join('\n')}\n`);
+          }
+          out.push(`已逆推并写入：大纲/总纲.md、人物卡/（${charFiles.length} 人：${charFiles.join('、')}）、设定集/（${setFiles.length} 类：${setFiles.join('、')}）`);
           if (note) out.push(note);
         }
         if (args && args.title) {
@@ -1693,10 +1812,13 @@ ${kindRule}
 - novel_deai 只用于处理外来文本、AI 旧稿或最终兜底，不进入日常成稿流程。
 
 九、作品工程与落盘（Obsidian 友好）
-- 成果统一落盘 Markdown：大纲/设定集/人物卡用标题与列表；章节正文用纯文本、不加任何 markdown 符号。
-- 工程目录：正文/（每章一个文件：正文/第001章-标题.md）、大纲/、设定集/、人物卡/、归档/，以及 伏笔清单.md、时间线.md、README.md（索引）。
-- 用 novel_project 初始化工程、保存章节、生成伏笔清单、生成时间线、统计进度、整理索引；鼓励用户用 Obsidian 打开工作区阅读与批注。
-- 存量旧稿用 novel_import 一键导入（自动分章落盘，并逆推大纲/人物卡/设定集）；连载中期定期用 novel_scan_book 做全书体检（跨章矛盾 + 跨章重复检测）。
+- 成果统一落盘 Markdown；章节正文用纯文本、不加任何 markdown 符号。
+- **每人一文件**：人物卡/角色名.md（一个角色一个文件，不用大文件堆所有人物）；角色关系与设定关联用 Obsidian 双链 [[角色名]]、[[设定集/xxx]]。
+- **每类一文件**：设定集/按类别分文件（世界观、力量体系、地理、势力各一个 .md），不用单文件堆所有设定。
+- 工程目录：正文/（第001章-标题.md）、大纲/（总纲.md + 分卷）、设定集/（分类文件 + _索引.md）、人物卡/（每人一文件 + _索引.md）、归档/、伏笔清单.md、时间线.md、README.md（全量双链索引）。
+- 用 novel_project 初始化工程/保存章节/伏笔清单/时间线/统计进度/整理索引；novel_character(save=true) 和 novel_worldbuilding(save=true) 自动按每人/每类分文件保存并更新索引；novel_import 自动拆分旧稿为每人/每类一文件。
+- 用 [[双链]] 互相关联：人物卡 ↔ 设定集 ↔ 伏笔清单 ↔ 时间线 ↔ 章节正文；在 Obsidian 中用图谱视图看清整个设定网络。
+- 存量旧稿用 novel_import 一键导入；连载中期定期用 novel_scan_book 做全书体检（跨章矛盾 + 跨章重复检测）。
 
 十、长篇连载循环（每章标准流程）
 - 写前：novel_briefing 生成写前简报（或先读大纲/人物卡/伏笔清单/最近归档），明确本章任务、出场人物、活跃伏笔与上文衔接；没有简报不动笔。
